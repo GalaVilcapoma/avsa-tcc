@@ -1,0 +1,257 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AVSA - Taller Cloud Computing: TODO EN UNA SOLA EC2 (costo minimo).
+  SQL Server Express + MongoDB 7 + Backend Java + Backend Python en Docker.
+  Frontend en Amazon S3.
+
+# ============================================================================
+# PARAMETROS
+# ============================================================================
+Parameters:
+  Capacidad:
+    Type: String
+    Default: OnDemand
+    AllowedValues: [Spot, OnDemand]
+    Description: Spot es mas barato (~70%) pero puede interrumpirse. OnDemand sin riesgo.
+
+  InstanceType:
+    Type: String
+    Default: t3a.medium
+    AllowedValues: [t3a.medium, t3.medium, t2.medium]
+    Description: Minimo 4 GB RAM para SQL Server Express + los 4 contenedores.
+
+  UbuntuAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+    Description: AMI Ubuntu 22.04 LTS (se resuelve automaticamente).
+
+  ScriptUrl:
+    Type: String
+    Default: https://raw.githubusercontent.com/GalaVilcapoma/avsa-tcc/main/despliegue-taller-barato/scripts/instalar-todo.sh
+    Description: URL del script de instalacion en GitHub (rama main o develop).
+
+  DockerUser:
+    Type: String
+    Default: anthonygala
+    Description: Usuario de Docker Hub donde estan las imagenes.
+
+Conditions:
+  EsSpot: !Equals [!Ref Capacidad, Spot]
+
+# ============================================================================
+# RECURSOS (4 SERVICIOS AWS: EC2, EBS, S3, VPC)
+# ============================================================================
+Resources:
+
+  # ── VPC ──────────────────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: avsa-taller-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: avsa-taller-igw
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: avsa-taller-public
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: avsa-taller-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRTAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AVSA Taller - SSH, Backend Java 8081, Backend Python 8000
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH
+        - IpProtocol: tcp
+          FromPort: 8081
+          ToPort: 8081
+          CidrIp: 0.0.0.0/0
+          Description: Backend Java Spring Boot
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: 0.0.0.0/0
+          Description: Backend Python Analytics
+      Tags:
+        - Key: Name
+          Value: avsa-taller-sg
+
+  # ── IP Elastica ──────────────────────────────────────────────────────────
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: avsa-taller-eip
+
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ElasticIP.AllocationId
+      InstanceId: !Ref EC2Instance
+
+  # ── S3 para Frontend ────────────────────────────────────────────────────
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      Tags:
+        - Key: Name
+          Value: avsa-taller-frontend
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicRead
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${FrontendBucket}/*'
+
+  # ── EC2 (todo en uno con Docker) ─────────────────────────────────────────
+  # Usa Launch Template para soportar Spot y OnDemand
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref UbuntuAmi
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: LabInstanceProfile
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            SubnetId: !Ref PublicSubnet
+            Groups:
+              - !Ref SecurityGroup
+            AssociatePublicIpAddress: true
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: 16
+              VolumeType: gp3
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            export BUCKET="${FrontendBucket}"
+            export PUBLIC_IP="${ElasticIP}"
+            export DOCKER_USER="${DockerUser}"
+            export SCRIPT_URL="${ScriptUrl}"
+            curl -fsSL --retry 5 "$SCRIPT_URL" | bash
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: avsa-taller-todo-en-uno
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      InstanceMarketOptions:
+        !If
+          - EsSpot
+          - MarketType: spot
+            SpotOptions:
+              SpotInstanceType: persistent
+              InstanceInterruptionBehavior: stop
+          - !Ref AWS::NoValue
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  Frontend:
+    Description: URL del frontend (Amazon S3)
+    Value: !Sub 'http://${FrontendBucket}.s3-website-${AWS::Region}.amazonaws.com'
+
+  BackendJavaSwagger:
+    Description: Swagger del Backend Java (Spring Boot)
+    Value: !Sub 'http://${ElasticIP}:8081/swagger-ui.html'
+
+  BackendPythonDocs:
+    Description: Docs del Backend Python (FastAPI)
+    Value: !Sub 'http://${ElasticIP}:8000/docs'
+
+  BackendPythonHealth:
+    Description: Health check del Backend Python
+    Value: !Sub 'http://${ElasticIP}:8000/'
+
+  Bucket:
+    Description: Nombre del bucket S3
+    Value: !Ref FrontendBucket
+
+  PublicIP:
+    Description: IP Elastica de la EC2
+    Value: !Ref ElasticIP
+
+  EC2InstanceId:
+    Description: ID de la instancia EC2
+    Value: !Ref EC2Instance
+
+  Servicios:
+    Description: Los 4 servicios AWS utilizados
+    Value: 'EC2, EBS (gp3 16GiB), S3 (frontend estatico), VPC (red + SG + EIP)'
